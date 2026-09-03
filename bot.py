@@ -31,7 +31,7 @@ TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {int(value.strip()) for value in os.environ.get("ADMIN_IDS", "").split(",") if value.strip().isdigit()}
 DB_PATH = Path(os.environ.get("DATABASE_PATH", "data/bonus_bot.sqlite3"))
 
-SEARCH_PHONE, ADD_PURCHASE, WRITE_OFF, SET_PERCENT, SET_MONTHS, ADD_CLIENT_PHONE, ADD_CLIENT_NAME, ADD_CLIENT_LASTNAME = range(8)
+SEARCH_PHONE, ADD_PURCHASE, WRITE_OFF, SET_PERCENT, SET_MONTHS, ADD_CLIENT_NAME, ADD_CLIENT_PHONE, EDIT_NAME, EDIT_PHONE, EDIT_CONFIRM = range(10)
 
 
 def utcnow() -> datetime:
@@ -67,43 +67,67 @@ def db() -> Iterator[sqlite3.Connection]:
 
 
 
+
 def migrate_users_table(conn: sqlite3.Connection) -> None:
-    """Fix old databases where telegram_id was NOT NULL."""
+    """Migrate legacy users table to unified name field and nullable telegram_id."""
     columns = conn.execute("PRAGMA table_info(users)").fetchall()
     if not columns:
         return
 
-    telegram_column = next((c for c in columns if c["name"] == "telegram_id"), None)
-    if telegram_column and telegram_column["notnull"] == 1:
+    names = {column["name"] for column in columns}
+    telegram_column = next((column for column in columns if column["name"] == "telegram_id"), None)
+    needs_migration = (
+        "name" not in names
+        or "first_name" in names
+        or "last_name" in names
+        or (telegram_column and telegram_column["notnull"] == 1)
+    )
+    if not needs_migration:
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
         conn.executescript("""
             CREATE TABLE users_new (
                 id INTEGER PRIMARY KEY,
                 telegram_id INTEGER UNIQUE,
-                first_name TEXT NOT NULL,
-                last_name TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL,
                 phone TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL
             );
-
-            INSERT INTO users_new (id, telegram_id, first_name, last_name, phone, created_at)
-            SELECT id, telegram_id, first_name, last_name, phone, created_at
-            FROM users;
-
+        """)
+        if "name" in names:
+            conn.execute("""
+                INSERT INTO users_new (id, telegram_id, name, phone, created_at)
+                SELECT id, telegram_id, TRIM(name), phone, created_at
+                FROM users
+            """)
+        else:
+            conn.execute("""
+                INSERT INTO users_new (id, telegram_id, name, phone, created_at)
+                SELECT id,
+                       telegram_id,
+                       TRIM(COALESCE(first_name, '') || ' ' || COALESCE(last_name, '')),
+                       phone,
+                       created_at
+                FROM users
+            """)
+        conn.executescript("""
             DROP TABLE users;
             ALTER TABLE users_new RENAME TO users;
-
             CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
         """)
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
 
 def init_db() -> None:
     with db() as conn:
-        migrate_users_table(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 telegram_id INTEGER UNIQUE,
-                first_name TEXT NOT NULL,
-                last_name TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL,
                 phone TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL
             );
@@ -125,11 +149,11 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
             CREATE INDEX IF NOT EXISTS idx_lots_active ON bonus_lots(user_id, expires_at, remaining_amount);
         """)
+        migrate_users_table(conn)
         conn.execute(
             "INSERT OR IGNORE INTO settings (id, percent, valid_months, updated_at) VALUES (1, '5', 12, ?)",
             (utcnow().isoformat(),),
         )
-
 
 def is_admin(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id in ADMIN_IDS)
@@ -169,6 +193,7 @@ def balance(user_id: int) -> int:
     return sum(row["remaining_amount"] for row in active_lots(user_id))
 
 
+
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 Найти пользователя", callback_data="search")],
@@ -177,23 +202,31 @@ def main_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def navigation_keyboard(back_callback: str = "menu") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Назад", callback_data=back_callback)],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+    ])
+
+
 def card_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Начислить бонусы", callback_data=f"add:{user_id}")],
         [InlineKeyboardButton("➖ Списать бонусы", callback_data=f"writeoff:{user_id}")],
+        [InlineKeyboardButton("✏️ Редактировать", callback_data=f"edit:{user_id}")],
+        [InlineKeyboardButton("🗑 Удалить клиента", callback_data=f"delete:{user_id}")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
     ])
 
 
 def user_card(user: sqlite3.Row) -> str:
     return (
-        f"<b>Карточка пользователя</b>\n\n"
-        f"{user['last_name']} {user['first_name']}\n"
+        f"<b>Карточка клиента</b>\n\n"
+        f"{user['name']}\n"
         f"Телефон: {user['phone']}\n"
         f"Сумма трат: {money(user['total_spent'])} ₽\n"
         f"Доступно бонусов: {money(user['bonus_balance'])} ₽"
     )
-
 
 def card_row(user_id: int) -> sqlite3.Row | None:
     with db() as conn:
@@ -206,11 +239,27 @@ def card_row(user_id: int) -> sqlite3.Row | None:
 
 
 
+
 @admin_only
 async def add_client_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Введите номер телефона нового клиента.")
+    context.user_data.pop("new_client_name", None)
+    await query.edit_message_text(
+        "Введите имя клиента одним сообщением.\nНапример: Иван Петров",
+        reply_markup=navigation_keyboard("menu"),
+    )
+    return ADD_CLIENT_NAME
+
+
+@admin_only
+async def add_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text("Введите имя клиента.", reply_markup=navigation_keyboard("menu"))
+        return ADD_CLIENT_NAME
+    context.user_data["new_client_name"] = name
+    await update.message.reply_text("Введите номер телефона клиента.", reply_markup=navigation_keyboard("add_client"))
     return ADD_CLIENT_PHONE
 
 
@@ -218,57 +267,27 @@ async def add_client_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def add_client_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     phone = "+" + "".join(ch for ch in update.message.text if ch.isdigit())
     if len(phone) < 5:
-        await update.message.reply_text("Введите корректный номер телефона.")
+        await update.message.reply_text("Введите корректный номер телефона.", reply_markup=navigation_keyboard("add_client"))
         return ADD_CLIENT_PHONE
+
     with db() as conn:
         exists = conn.execute("SELECT id FROM users WHERE phone = ?", (phone,)).fetchone()
     if exists:
-        await update.message.reply_text("Такой клиент уже существует.")
+        await update.message.reply_text("Такой клиент уже существует.", reply_markup=main_menu())
         return ConversationHandler.END
-    context.user_data["new_client_phone"] = phone
-    await update.message.reply_text("Введите имя клиента.")
-    return ADD_CLIENT_NAME
 
-
-@admin_only
-async def add_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_client_name"] = update.message.text.strip()
-    await update.message.reply_text("Введите фамилию клиента.")
-    return ADD_CLIENT_LASTNAME
-
-
-@admin_only
-async def add_client_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    first_name = context.user_data.get("new_client_name", "")
-    last_name = update.message.text.strip()
-    phone = context.user_data.get("new_client_phone", "")
-
-    try:
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)",
-                (None, first_name, last_name, phone, utcnow().isoformat())
-            )
-
-        await update.message.reply_text(
-            f"✅ Клиент успешно добавлен!\n\n"
-            f"{last_name} {first_name}\n"
-            f"📱 {phone}\n\n"
-            "Выберите действие:",
-            reply_markup=main_menu()
+    name = context.user_data.get("new_client_name", "")
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO users (telegram_id, name, phone, created_at) VALUES (?, ?, ?, ?)",
+            (None, name, phone, utcnow().isoformat()),
         )
-
-    except Exception as e:
-        logging.exception("Ошибка добавления клиента")
-        await update.message.reply_text(
-            f"❌ Не удалось добавить клиента.\nПричина: {e}",
-            reply_markup=main_menu()
-        )
-
+    await update.message.reply_text(
+        f"✅ Клиент успешно добавлен!\n\n{name}\n📱 {phone}\n\nВыберите действие:",
+        reply_markup=main_menu(),
+    )
     context.user_data.pop("new_client_name", None)
-    context.user_data.pop("new_client_phone", None)
     return ConversationHandler.END
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_admin(update):
@@ -293,14 +312,13 @@ async def register_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         existing = conn.execute("SELECT id FROM users WHERE telegram_id = ?", (person.id,)).fetchone()
         try:
             if existing:
-                conn.execute("UPDATE users SET first_name = ?, last_name = ?, phone = ? WHERE telegram_id = ?", (person.first_name, person.last_name or "", phone, person.id))
+                conn.execute("UPDATE users SET name = ?, phone = ? WHERE telegram_id = ?", (person.full_name, phone, person.id))
             else:
                 by_phone = conn.execute("SELECT id FROM users WHERE phone = ?", (phone,)).fetchone()
                 if by_phone:
-                    conn.execute("UPDATE users SET telegram_id = ?, first_name = ?, last_name = ? WHERE phone = ?",
-                                 (person.id, person.first_name, person.last_name or "", phone))
+                    conn.execute("UPDATE users SET telegram_id = ? WHERE phone = ?", (person.id, phone))
                 else:
-                    conn.execute("INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)", (person.id, person.first_name, person.last_name or "", phone, utcnow().isoformat()))
+                    conn.execute("INSERT INTO users (telegram_id, name, phone, created_at) VALUES (?, ?, ?, ?)", (person.id, person.full_name, phone, utcnow().isoformat()))
         except sqlite3.IntegrityError:
             await update.message.reply_text("Этот номер уже привязан к другому аккаунту. Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
             return
@@ -367,11 +385,11 @@ async def search_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text("Введите минимум 3 цифры номера.")
         return SEARCH_PHONE
     with db() as conn:
-        rows = conn.execute("SELECT id, first_name, last_name, phone FROM users WHERE REPLACE(REPLACE(phone, '+', ''), ' ', '') LIKE ? LIMIT 10", (f"%{digits}%",)).fetchall()
+        rows = conn.execute("SELECT id, name, phone FROM users WHERE REPLACE(REPLACE(phone, '+', ''), ' ', '') LIKE ? LIMIT 10", (f"%{digits}%",)).fetchall()
     if not rows:
         await update.message.reply_text("Совпадений нет. Введите другой номер или нажмите «Назад».", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data="menu")]]))
         return SEARCH_PHONE
-    buttons = [[InlineKeyboardButton(f"{row['last_name']} {row['first_name']} — {row['phone']}", callback_data=f"card:{row['id']}")] for row in rows]
+    buttons = [[InlineKeyboardButton(f"{row['name']} — {row['phone']}", callback_data=f"card:{row['id']}")] for row in rows]
     buttons.append([InlineKeyboardButton("Назад", callback_data="menu")])
     await update.message.reply_text("Выберите пользователя:", reply_markup=InlineKeyboardMarkup(buttons))
     return ConversationHandler.END
@@ -389,13 +407,156 @@ async def open_card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.edit_message_text(user_card(user), parse_mode=ParseMode.HTML, reply_markup=card_keyboard(user_id))
 
 
+
+@admin_only
+async def edit_client_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":")[1])
+    user = card_row(user_id)
+    if not user:
+        await query.edit_message_text("Пользователь не найден.", reply_markup=main_menu())
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 Имя", callback_data=f"editname:{user_id}")],
+        [InlineKeyboardButton("📱 Телефон", callback_data=f"editphone:{user_id}")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data=f"card:{user_id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+    ])
+    await query.edit_message_text(
+        f"<b>Редактирование клиента</b>\n\n{user['name']}\n{user['phone']}\n\nЧто изменить?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@admin_only
+async def edit_name_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":")[1])
+    context.user_data["edit_user_id"] = user_id
+    await query.edit_message_text("Введите новое имя клиента.", reply_markup=navigation_keyboard(f"edit:{user_id}"))
+    return EDIT_NAME
+
+
+@admin_only
+async def edit_name_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.message.text.strip()
+    user_id = context.user_data.get("edit_user_id")
+    user = card_row(user_id)
+    context.user_data["edit_field"] = "name"
+    context.user_data["edit_value"] = value
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data="editconfirm")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"edit:{user_id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+    ])
+    await update.message.reply_text(
+        f"Подтвердить изменение?\n\nБыло:\n{user['name']}\n\nСтало:\n{value}",
+        reply_markup=keyboard,
+    )
+    return EDIT_CONFIRM
+
+
+@admin_only
+async def edit_phone_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":")[1])
+    context.user_data["edit_user_id"] = user_id
+    await query.edit_message_text("Введите новый номер телефона клиента.", reply_markup=navigation_keyboard(f"edit:{user_id}"))
+    return EDIT_PHONE
+
+
+@admin_only
+async def edit_phone_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    phone = "+" + "".join(ch for ch in update.message.text if ch.isdigit())
+    user_id = context.user_data.get("edit_user_id")
+    if len(phone) < 5:
+        await update.message.reply_text("Введите корректный номер телефона.")
+        return EDIT_PHONE
+    with db() as conn:
+        duplicate = conn.execute("SELECT id FROM users WHERE phone = ? AND id <> ?", (phone, user_id)).fetchone()
+    if duplicate:
+        await update.message.reply_text("Этот номер уже используется другим клиентом.")
+        return EDIT_PHONE
+    user = card_row(user_id)
+    context.user_data["edit_field"] = "phone"
+    context.user_data["edit_value"] = phone
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data="editconfirm")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"edit:{user_id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+    ])
+    await update.message.reply_text(
+        f"Подтвердить изменение?\n\nБыло:\n{user['phone']}\n\nСтало:\n{phone}",
+        reply_markup=keyboard,
+    )
+    return EDIT_CONFIRM
+
+
+@admin_only
+async def edit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = context.user_data.get("edit_user_id")
+    field = context.user_data.get("edit_field")
+    value = context.user_data.get("edit_value")
+    if field not in {"name", "phone"} or not user_id:
+        await query.edit_message_text("Не удалось определить изменение.", reply_markup=main_menu())
+        return ConversationHandler.END
+    with db() as conn:
+        conn.execute(f"UPDATE users SET {field} = ? WHERE id = ?", (value, user_id))
+    user = card_row(user_id)
+    await query.edit_message_text(
+        "✅ Данные изменены.\n\n" + user_card(user),
+        parse_mode=ParseMode.HTML,
+        reply_markup=card_keyboard(user_id),
+    )
+    return ConversationHandler.END
+
+
+@admin_only
+async def delete_client_screen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":")[1])
+    user = card_row(user_id)
+    if not user:
+        await query.edit_message_text("Пользователь не найден.", reply_markup=main_menu())
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Удалить", callback_data=f"deleteconfirm:{user_id}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"card:{user_id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu")],
+    ])
+    await query.edit_message_text(
+        f"⚠️ <b>Удалить клиента?</b>\n\n{user['name']}\n{user['phone']}\n\n"
+        "Будут полностью удалены клиент и его бонусы.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+@admin_only
+async def delete_client_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":")[1])
+    with db() as conn:
+        conn.execute("DELETE FROM bonus_lots WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    await query.edit_message_text("✅ Клиент полностью удалён.\n\nВыберите действие:", reply_markup=main_menu())
+
+
 @admin_only
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data["target_user_id"] = int(query.data.split(":")[1])
     config = get_settings()
-    await query.edit_message_text(f"Введите сумму покупки. На неё будет начислено {config['percent']}% бонусами.")
+    await query.edit_message_text(f"Введите сумму покупки. На неё будет начислено {config['percent']}% бонусами.", reply_markup=navigation_keyboard(f"card:{context.user_data['target_user_id']}"))
     return ADD_PURCHASE
 
 
@@ -442,7 +603,7 @@ async def writeoff_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     user_id = int(query.data.split(":")[1])
     context.user_data["target_user_id"] = user_id
-    await query.edit_message_text(f"Доступно для списания: {money(balance(user_id))} ₽\nВведите сумму списания.")
+    await query.edit_message_text(f"Доступно для списания: {money(balance(user_id))} ₽\nВведите сумму списания.", reply_markup=navigation_keyboard(f"card:{user_id}"))
     return WRITE_OFF
 
 
@@ -481,7 +642,7 @@ async def writeoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def percent_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Введите новый процент начисления, например: 7.5")
+    await query.edit_message_text("Введите новый процент начисления, например: 7.5", reply_markup=navigation_keyboard("settings"))
     return SET_PERCENT
 
 
@@ -505,7 +666,7 @@ async def set_percent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def months_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Введите срок действия новых бонусов в месяцах (от 1 до 120).")
+    await query.edit_message_text("Введите срок действия новых бонусов в месяцах (от 1 до 120).", reply_markup=navigation_keyboard("settings"))
     return SET_MONTHS
 
 
@@ -576,19 +737,43 @@ def main() -> None:
         allow_reentry=True,
     ))
 
+
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(add_client_start, pattern="^add_client$")],
         states={
-            ADD_CLIENT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_phone)],
             ADD_CLIENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_name)],
-            ADD_CLIENT_LASTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_lastname)],
+            ADD_CLIENT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_phone)],
         },
-        fallbacks=[CallbackQueryHandler(open_menu, pattern="^menu$")],
+        fallbacks=[
+            CallbackQueryHandler(add_client_start, pattern="^add_client$"),
+            CallbackQueryHandler(open_menu, pattern="^menu$"),
+        ],
+        allow_reentry=True,
+    ))
+
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(edit_name_start, pattern="^editname:"),
+            CallbackQueryHandler(edit_phone_start, pattern="^editphone:"),
+        ],
+        states={
+            EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name_value)],
+            EDIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_phone_value)],
+            EDIT_CONFIRM: [CallbackQueryHandler(edit_confirm, pattern="^editconfirm$")],
+        },
+        fallbacks=[
+            CallbackQueryHandler(edit_client_screen, pattern="^edit:"),
+            CallbackQueryHandler(open_card, pattern="^card:"),
+            CallbackQueryHandler(open_menu, pattern="^menu$"),
+        ],
         allow_reentry=True,
     ))
     app.add_handler(CallbackQueryHandler(open_menu, pattern="^menu$"))
     app.add_handler(CallbackQueryHandler(settings_screen, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(open_card, pattern="^card:"))
+    app.add_handler(CallbackQueryHandler(edit_client_screen, pattern="^edit:"))
+    app.add_handler(CallbackQueryHandler(delete_client_screen, pattern="^delete:"))
+    app.add_handler(CallbackQueryHandler(delete_client_confirm, pattern="^deleteconfirm:"))
     app.add_error_handler(error_handler)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
