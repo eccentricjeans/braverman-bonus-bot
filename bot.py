@@ -66,8 +66,38 @@ def db() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+
+def migrate_users_table(conn: sqlite3.Connection) -> None:
+    """Fix old databases where telegram_id was NOT NULL."""
+    columns = conn.execute("PRAGMA table_info(users)").fetchall()
+    if not columns:
+        return
+
+    telegram_column = next((c for c in columns if c["name"] == "telegram_id"), None)
+    if telegram_column and telegram_column["notnull"] == 1:
+        conn.executescript("""
+            CREATE TABLE users_new (
+                id INTEGER PRIMARY KEY,
+                telegram_id INTEGER UNIQUE,
+                first_name TEXT NOT NULL,
+                last_name TEXT NOT NULL DEFAULT '',
+                phone TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+
+            INSERT INTO users_new (id, telegram_id, first_name, last_name, phone, created_at)
+            SELECT id, telegram_id, first_name, last_name, phone, created_at
+            FROM users;
+
+            DROP TABLE users;
+            ALTER TABLE users_new RENAME TO users;
+
+            CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+        """)
+
 def init_db() -> None:
     with db() as conn:
+        migrate_users_table(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
@@ -214,6 +244,10 @@ async def add_client_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE
             "INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)",
             (None, context.user_data.get("new_client_name",""), update.message.text.strip(), context.user_data["new_client_phone"], utcnow().isoformat())
         )
+    first_name = context.user_data.get("new_client_name", "")
+    last_name = update.message.text.strip()
+    phone = context.user_data.get("new_client_phone", "")
+
     await update.message.reply_text(
         f"✅ Клиент успешно добавлен!\n\n"
         f"{first_name} {last_name}\n"
@@ -478,6 +512,11 @@ async def set_months(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("Unhandled error:", exc_info=context.error)
+
+
 def main() -> None:
     if not TOKEN or TOKEN.startswith("123456:"):
         raise RuntimeError("Укажите BOT_TOKEN в файле .env")
@@ -538,7 +577,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(open_menu, pattern="^menu$"))
     app.add_handler(CallbackQueryHandler(settings_screen, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(open_card, pattern="^card:"))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_error_handler(error_handler)\n    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
