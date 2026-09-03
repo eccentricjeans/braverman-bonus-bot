@@ -239,22 +239,34 @@ async def add_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @admin_only
 async def add_client_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)",
-            (None, context.user_data.get("new_client_name",""), update.message.text.strip(), context.user_data["new_client_phone"], utcnow().isoformat())
-        )
     first_name = context.user_data.get("new_client_name", "")
     last_name = update.message.text.strip()
     phone = context.user_data.get("new_client_phone", "")
 
-    await update.message.reply_text(
-        f"✅ Клиент успешно добавлен!\n\n"
-        f"{first_name} {last_name}\n"
-        f"📱 {phone}\n\n"
-        "Выберите действие:",
-        reply_markup=main_menu()
-    )
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)",
+                (None, first_name, last_name, phone, utcnow().isoformat())
+            )
+
+        await update.message.reply_text(
+            f"✅ Клиент успешно добавлен!\n\n"
+            f"{last_name} {first_name}\n"
+            f"📱 {phone}\n\n"
+            "Выберите действие:",
+            reply_markup=main_menu()
+        )
+
+    except Exception as e:
+        logging.exception("Ошибка добавления клиента")
+        await update.message.reply_text(
+            f"❌ Не удалось добавить клиента.\nПричина: {e}",
+            reply_markup=main_menu()
+        )
+
+    context.user_data.pop("new_client_name", None)
+    context.user_data.pop("new_client_phone", None)
     return ConversationHandler.END
 
 
