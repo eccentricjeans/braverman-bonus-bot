@@ -214,7 +214,13 @@ async def add_client_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE
             "INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)",
             (None, context.user_data.get("new_client_name",""), update.message.text.strip(), context.user_data["new_client_phone"], utcnow().isoformat())
         )
-    await update.message.reply_text("Клиент добавлен.", reply_markup=main_menu())
+    await update.message.reply_text(
+        f"✅ Клиент успешно добавлен!\n\n"
+        f"{first_name} {last_name}\n"
+        f"📱 {phone}\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu()
+    )
     return ConversationHandler.END
 
 
