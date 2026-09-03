@@ -589,7 +589,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(open_menu, pattern="^menu$"))
     app.add_handler(CallbackQueryHandler(settings_screen, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(open_card, pattern="^card:"))
-    app.add_error_handler(error_handler)\n    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_error_handler(error_handler)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
