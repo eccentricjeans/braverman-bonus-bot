@@ -31,7 +31,7 @@ TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {int(value.strip()) for value in os.environ.get("ADMIN_IDS", "").split(",") if value.strip().isdigit()}
 DB_PATH = Path(os.environ.get("DATABASE_PATH", "data/bonus_bot.sqlite3"))
 
-SEARCH_PHONE, ADD_PURCHASE, WRITE_OFF, SET_PERCENT, SET_MONTHS = range(5)
+SEARCH_PHONE, ADD_PURCHASE, WRITE_OFF, SET_PERCENT, SET_MONTHS, ADD_CLIENT_PHONE, ADD_CLIENT_NAME, ADD_CLIENT_LASTNAME = range(8)
 
 
 def utcnow() -> datetime:
@@ -71,7 +71,7 @@ def init_db() -> None:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
-                telegram_id INTEGER NOT NULL UNIQUE,
+                telegram_id INTEGER UNIQUE,
                 first_name TEXT NOT NULL,
                 last_name TEXT NOT NULL DEFAULT '',
                 phone TEXT NOT NULL UNIQUE,
@@ -142,6 +142,7 @@ def balance(user_id: int) -> int:
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 Найти пользователя", callback_data="search")],
+        [InlineKeyboardButton("➕ Добавить клиента", callback_data="add_client")],
         [InlineKeyboardButton("⚙️ Настройка бонусной системы", callback_data="settings")],
     ])
 
@@ -174,6 +175,49 @@ def card_row(user_id: int) -> sqlite3.Row | None:
         """, (utcnow().isoformat(), user_id)).fetchone()
 
 
+
+@admin_only
+async def add_client_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Введите номер телефона нового клиента.")
+    return ADD_CLIENT_PHONE
+
+
+@admin_only
+async def add_client_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    phone = "+" + "".join(ch for ch in update.message.text if ch.isdigit())
+    if len(phone) < 5:
+        await update.message.reply_text("Введите корректный номер телефона.")
+        return ADD_CLIENT_PHONE
+    with db() as conn:
+        exists = conn.execute("SELECT id FROM users WHERE phone = ?", (phone,)).fetchone()
+    if exists:
+        await update.message.reply_text("Такой клиент уже существует.")
+        return ConversationHandler.END
+    context.user_data["new_client_phone"] = phone
+    await update.message.reply_text("Введите имя клиента.")
+    return ADD_CLIENT_NAME
+
+
+@admin_only
+async def add_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["new_client_name"] = update.message.text.strip()
+    await update.message.reply_text("Введите фамилию клиента.")
+    return ADD_CLIENT_LASTNAME
+
+
+@admin_only
+async def add_client_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)",
+            (None, context.user_data.get("new_client_name",""), update.message.text.strip(), context.user_data["new_client_phone"], utcnow().isoformat())
+        )
+    await update.message.reply_text("Клиент добавлен.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_admin(update):
         await update.message.reply_text("<b>Панель администратора</b>\nВыберите действие.", parse_mode=ParseMode.HTML, reply_markup=main_menu())
@@ -199,7 +243,12 @@ async def register_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if existing:
                 conn.execute("UPDATE users SET first_name = ?, last_name = ?, phone = ? WHERE telegram_id = ?", (person.first_name, person.last_name or "", phone, person.id))
             else:
-                conn.execute("INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)", (person.id, person.first_name, person.last_name or "", phone, utcnow().isoformat()))
+                by_phone = conn.execute("SELECT id FROM users WHERE phone = ?", (phone,)).fetchone()
+                if by_phone:
+                    conn.execute("UPDATE users SET telegram_id = ?, first_name = ?, last_name = ? WHERE phone = ?",
+                                 (person.id, person.first_name, person.last_name or "", phone))
+                else:
+                    conn.execute("INSERT INTO users (telegram_id, first_name, last_name, phone, created_at) VALUES (?, ?, ?, ?, ?)", (person.id, person.first_name, person.last_name or "", phone, utcnow().isoformat()))
         except sqlite3.IntegrityError:
             await update.message.reply_text("Этот номер уже привязан к другому аккаунту. Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
             return
@@ -328,7 +377,8 @@ async def add_purchase(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     new_balance = balance(user_id)
     await update.message.reply_text(f"Начислено {money(earned)} ₽.\n\n{user_card(card_row(user_id))}", parse_mode=ParseMode.HTML, reply_markup=card_keyboard(user_id))
     try:
-        await context.bot.send_message(user["telegram_id"], f"Бонусный баланс пополнен на {money(earned)} рублей.\nОбщий баланс бонусов: {money(new_balance)} рублей.")
+        if user["telegram_id"]:
+            await context.bot.send_message(user["telegram_id"], f"Бонусный баланс пополнен на {money(earned)} рублей.\nОбщий баланс бонусов: {money(new_balance)} рублей.")
     except Exception:
         logging.warning("Could not notify user %s", user["id"])
     return ConversationHandler.END
@@ -368,7 +418,8 @@ async def writeoff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     remaining_balance = balance(user_id)
     await update.message.reply_text(f"Списано {money(amount)} ₽.\n\n{user_card(user)}", parse_mode=ParseMode.HTML, reply_markup=card_keyboard(user_id))
     try:
-        await context.bot.send_message(user["telegram_id"], f"Списано с бонусного баланса: {money(amount)} рублей.\nОстаток бонусов: {money(remaining_balance)} рублей.")
+        if user["telegram_id"]:
+            await context.bot.send_message(user["telegram_id"], f"Списано с бонусного баланса: {money(amount)} рублей.\nОстаток бонусов: {money(remaining_balance)} рублей.")
     except Exception:
         logging.warning("Could not notify user %s", user_id)
     return ConversationHandler.END
@@ -464,6 +515,17 @@ def main() -> None:
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(months_start, pattern="^setmonths$")],
         states={SET_MONTHS: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_months)]},
+        fallbacks=[CallbackQueryHandler(open_menu, pattern="^menu$")],
+        allow_reentry=True,
+    ))
+
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_client_start, pattern="^add_client$")],
+        states={
+            ADD_CLIENT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_phone)],
+            ADD_CLIENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_name)],
+            ADD_CLIENT_LASTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_client_lastname)],
+        },
         fallbacks=[CallbackQueryHandler(open_menu, pattern="^menu$")],
         allow_reentry=True,
     ))
